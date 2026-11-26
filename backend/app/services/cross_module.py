@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.store import store
+from app.services import dispatch_claim
 
 CST = timezone(timedelta(hours=8))
 
@@ -776,6 +777,17 @@ class CrossModuleService:
             "abnormal": False,
         }
         agg_rows.append(agg_task)
+
+        # 同步登记正式分发批次：A=20、B=3，供后续领取凭证按快照交付。
+        dispatch_claim.create_batch(
+            agg_task["任务编号"],
+            output_topic=agg_task.get("输出Topic", ""),
+            aggregate_func=agg_task.get("聚合函数", "count_success"),
+            window_count=4,
+            value_a=20,
+            value_b=3,
+            remark="由固件升级聚合分发登记的首个正式分发批次",
+        )
 
         return {
             "ok": True,

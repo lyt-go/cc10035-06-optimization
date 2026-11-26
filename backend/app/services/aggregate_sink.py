@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services import dispatch_claim
 from app.store import store
 
 CST = timezone(timedelta(hours=8))
@@ -272,8 +273,9 @@ class AggregateSinkService(BaseModuleService):
 
         业务流程:
         1. 查找聚合任务
-        2. 创建批量导出任务
-        3. 返回关联关系
+        2. 找到该任务当前正式分发批次（没有则按任务登记一个）
+        3. 创建批量导出任务并带上批次/来源/确认时间
+        4. 返回关联关系
         """
         agg_rows = store.rows(self.MODULE)
         export_rows = store.rows("batch_export")
@@ -293,6 +295,17 @@ class AggregateSinkService(BaseModuleService):
         if export_format not in valid_formats:
             export_format = "CSV"
 
+        batch = dispatch_claim.current_batch(task_id)
+        if batch is None:
+            batch = dispatch_claim.create_batch(
+                task_id,
+                output_topic=output_topic,
+                aggregate_func=task.get("聚合函数", "count_success"),
+                window_count=4,
+                value_a=20,
+                value_b=3,
+                remark="由聚合任务登记的首个正式分发批次",
+            )
         max_id = max((int(row.get("id", 0)) for row in export_rows), default=0)
         export_task = {
             "id": max_id + 1,
@@ -301,12 +314,17 @@ class AggregateSinkService(BaseModuleService):
             "测点列表": data_window,
             "时间范围": f"{_now()}-24h ~ {_now()}",
             "导出格式": export_format,
-            "数据行数": "10000",
+            "数据行数": str(len(batch.get("窗口") or [])),
             "文件大小": "12MB",
             "导出状态": "待执行",
             "status": "待执行",
             "pending": True,
             "abnormal": False,
+            "分发批次": batch.get("批次编号", ""),
+            "快照版本": batch.get("版本", 1),
+            "来源摘要": batch.get("来源摘要", ""),
+            "确认时间": batch.get("确认时间", ""),
+            "值摘要": dispatch_claim.value_summary(batch.get("窗口") or []),
         }
         export_rows.append(export_task)
 
@@ -314,5 +332,85 @@ class AggregateSinkService(BaseModuleService):
             "ok": True,
             "message": f"聚合结果已分发至批量导出: {export_task['任务编号']}",
             "aggregate_task": task_id,
+            "batch": dispatch_claim.batch_summary(batch),
             "export_task": export_task,
         }
+
+    # ========== 分发批次与领取凭证 ==========
+
+    def list_dispatch_batches(self, task_id: str | None = None) -> list[dict[str, Any]]:
+        """列出正式分发批次及其当前版本标记。"""
+        rows = dispatch_claim.batch_rows()
+        if task_id:
+            rows = [row for row in rows if row.get("任务编号") == task_id]
+        summaries = [dispatch_claim.batch_summary(row) for row in rows]
+        return sorted(summaries, key=lambda item: (str(item.get("任务编号")), int(item.get("版本", 0) or 0)))
+
+    def get_dispatch_batch(self, reference: str) -> dict[str, Any]:
+        batch = dispatch_claim.resolve_batch(reference)
+        if batch is None:
+            return {"ok": False, "message": f"分发批次 {reference} 不存在"}
+        summary = dispatch_claim.batch_summary(batch)
+        return {
+            "ok": True,
+            "message": f"分发批次 {summary['批次编号']}（版本 {summary['版本']}）",
+            "batch": summary,
+            "窗口": dispatch_claim.copy_windows(batch.get("窗口") or []),
+        }
+
+    def correct_dispatch_result(
+        self, batch_reference: str, value_a: int | None = None,
+        value_b: int | None = None, remark: str = "", confirm_time: str = "",
+    ) -> dict[str, Any]:
+        """登记分发更正：A/B 等窗口值整体生成新版本，旧版本继续服务已发出凭证。"""
+        return dispatch_claim.correct_batch(
+            batch_reference,
+            value_a=value_a,
+            value_b=value_b,
+            remark=remark,
+            confirm_time=confirm_time or None,
+        )
+
+    def create_claim_voucher(
+        self, batch_reference: str, delivery_format: str = "CSV",
+        page_size: int = 2, remark: str = "",
+    ) -> dict[str, Any]:
+        """按批次生成领取凭证；凭证锁定该批次的窗口快照与实际采用的确认时间。"""
+        return dispatch_claim.create_voucher(
+            batch_reference or "",
+            delivery_format=delivery_format,
+            page_size=page_size,
+            remark=remark,
+        )
+
+    def claim_voucher_detail(self, voucher_reference: str) -> dict[str, Any]:
+        voucher = dispatch_claim.resolve_voucher(voucher_reference)
+        if voucher is None:
+            return {"ok": False, "message": f"领取凭证 {voucher_reference} 不存在"}
+        detail = dispatch_claim.voucher_detail(voucher)
+        return {"ok": True, "message": f"领取凭证 {detail['凭证编号']}", "voucher": detail}
+
+    def list_claim_vouchers(self, task_id: str | None = None) -> list[dict[str, Any]]:
+        rows = dispatch_claim.voucher_rows()
+        if task_id:
+            rows = [row for row in rows if row.get("任务编号") == task_id]
+        return [dispatch_claim.voucher_summary(row) for row in rows]
+
+    def package_claim_voucher(
+        self, voucher_reference: str, delivery_format: str = "",
+        fail_page: int | None = None, fail_after_page: int | None = None,
+        continue_snapshot: bool = False, restart: bool = False,
+    ) -> dict[str, Any]:
+        """按凭证快照组包，逐页记录进度；任何一页失败都不把凭证算作已领取。"""
+        return dispatch_claim.package_voucher(
+            voucher_reference,
+            delivery_format=delivery_format or None,
+            fail_page=fail_page,
+            fail_after_page=fail_after_page,
+            continue_snapshot=continue_snapshot,
+            restart=restart,
+        )
+
+    def build_claim_file(self, voucher_reference: str, delivery_format: str = "") -> dict[str, Any]:
+        """按凭证快照生成下载文件；只对完整组包成功的交付方式放行。"""
+        return dispatch_claim.build_file(voucher_reference, delivery_format or None)

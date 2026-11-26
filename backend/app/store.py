@@ -9,6 +9,11 @@ from typing import Any
 from app.seed import SEED_ROWS
 
 
+# 领取凭证/分发批次是聚合分发与批量导出之间的辅助表，不属于18个业务模块，
+# 不出现在模块列表和运营概览里，但仍走同一份内存仓库便于测试和排障。
+AUXILIARY_TABLES = {"dispatch_batches", "claim_vouchers"}
+
+
 class Store:
     def __init__(self) -> None:
         self._tables: dict[str, list[dict[str, Any]]] = {
@@ -16,7 +21,7 @@ class Store:
         }
 
     def module_names(self) -> list[str]:
-        return sorted(self._tables)
+        return sorted(name for name in self._tables if name not in AUXILIARY_TABLES)
 
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])

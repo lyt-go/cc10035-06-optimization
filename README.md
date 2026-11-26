@@ -77,5 +77,22 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 聚合分发 → 批量导出的批次领取
+
+聚合分发的每次正式确认登记为一个「分发批次」（`dispatch_batches`），操作人员按批次
+发起领取时生成「领取凭证」（`claim_vouchers`）。凭证创建瞬间锁定该批次的窗口快照、
+版本、来源和确认时间；之后批次即使被更正，也不影响已发出凭证的交付内容。
+
+- `GET  /api/dispatch/batches?task_id=`：查看批次及其当前/历史版本
+- `POST /api/dispatch/batches/correct`：登记分发更正，生成新的正式版本
+- `POST /api/dispatch/vouchers`：按批次生成领取凭证（CSV / JSON）
+- `GET  /api/dispatch/vouchers/{凭证}`：查看来源核验、采用确认时间和转换进度
+- `POST /api/dispatch/vouchers/{凭证}/package`：按凭证快照分页组包
+- `GET  /api/dispatch/vouchers/{凭证}/file`：下载已完整组包成功的交付文件
+
+组包按页推进：成功页计入已成功行数，失败页之后的页不假装成功。只有全部分页都成功，
+凭证才标记为「已领取」，半成品始终是未领取状态；失败时已选择的批次和交付方式保留在
+凭证上，再次领取按原快照续办。
+
 领域：数据工程
 子方向：数据采集、爬虫与RPA
